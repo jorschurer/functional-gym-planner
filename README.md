@@ -1,3 +1,12 @@
+---
+title: Functional Gym Planner
+emoji: 💪
+colorFrom: blue
+colorTo: purple
+sdk: static
+pinned: false
+---
+
 # Functional Gym Planner
 
 AI-powered periodization and workout planning tool for functional fitness gyms.
