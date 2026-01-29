@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { Layout } from './components/Layout';
 import { Button } from './components/Button';
-import { ICONS, MOCK_STUDIOS_INITIAL, LOADING_MESSAGES } from './constants';
-import { AppView, Studio, Cycle, Workout, CycleWeek } from './types';
-import { analyzeStudioPhoto, fileToGenerativePart, generateMacrocycle, generateDailyWorkouts } from './services/geminiService';
+import { ICONS, MOCK_STUDIOS_INITIAL, LOADING_MESSAGES, SESSION_CONFIGS, HYROX_EQUIPMENT, WEEKLY_THEMES } from './constants';
+import { AppView, Studio, Cycle, Workout, CycleWeek, SessionType } from './types';
+import { analyzeStudioPhoto, fileToGenerativePart, generateMacrocycle, generateWeeklyWorkouts } from './services/geminiService';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
 import { toPng } from 'html-to-image';
 
@@ -44,10 +44,15 @@ export default function App() {
   const [cycleFocus, setCycleFocus] = useState<'hyrox' | 'crossfit' | 'general_strength' | 'endurance'>('hyrox');
   const [cycleDuration, setCycleDuration] = useState(8);
 
-  // UI State for Viewing Workout
-  const [selectedDay, setSelectedDay] = useState<{week: number, day: number} | null>(null);
-  const [currentViewWeekIndex, setCurrentViewWeekIndex] = useState(0); // Add state to track which week is being viewed
+  // UI State for Viewing Workout (HYROX Weekly Model)
+  const [selectedSession, setSelectedSession] = useState<{week: number, sessionType: SessionType} | null>(null);
+  const [currentViewWeekIndex, setCurrentViewWeekIndex] = useState(0);
   const [isGeneratingWorkout, setIsGeneratingWorkout] = useState(false);
+
+  // UI State for Equipment Constraints
+  const [availableEquipment, setAvailableEquipment] = useState<string[]>([]);
+  const [showEquipmentModal, setShowEquipmentModal] = useState(false);
+  const [editingWorkout, setEditingWorkout] = useState<Workout | null>(null);
 
   // --- Effects ---
   useEffect(() => {
@@ -189,7 +194,8 @@ export default function App() {
     }
   };
 
-  const handleGenerateDay = async (week: CycleWeek, day: number) => {
+  // HYROX Weekly Session Generator
+  const handleGenerateSession = async (week: CycleWeek, sessionType: SessionType) => {
     if (!activeCycle) return;
     if (!apiKey) {
       alert("Please add your Gemini API Key in Profile Settings first.");
@@ -199,21 +205,42 @@ export default function App() {
 
     setIsGeneratingWorkout(true);
     try {
-      // Generate workouts for ALL studios at once for this day
-      const workouts = await generateDailyWorkouts(activeCycle, week, day, studios, apiKey);
+      // Generate workouts for ALL studios at once for this session type
+      const workouts = await generateWeeklyWorkouts(activeCycle, week, sessionType, studios, apiKey);
 
-      // Filter out old workouts for this day/week if re-generating
+      // Filter out old workouts for this session/week if re-generating
       const otherWorkouts = generatedWorkouts.filter(w =>
-        !(w.weekNumber === week.weekNumber && w.dayOfWeek === day)
+        !(w.weekNumber === week.weekNumber && w.sessionType === sessionType)
       );
 
       setGeneratedWorkouts([...otherWorkouts, ...workouts]);
-      setSelectedDay({ week: week.weekNumber, day });
+      setSelectedSession({ week: week.weekNumber, sessionType });
     } catch (error) {
       console.error(error);
-      alert('Failed to generate daily session.');
+      alert('Failed to generate session.');
     } finally {
       setIsGeneratingWorkout(false);
+    }
+  };
+
+  // Handle Gym Deletion
+  const handleDeleteStudio = (studioId: string) => {
+    if (window.confirm('Are you sure you want to delete this gym? This action cannot be undone.')) {
+      setStudios(studios.filter(s => s.id !== studioId));
+      // Remove workouts for this studio
+      setGeneratedWorkouts(generatedWorkouts.filter(w => w.studioId !== studioId));
+    }
+  };
+
+  // Update Cycle Equipment Constraints
+  const handleUpdateEquipmentConstraints = () => {
+    if (activeCycle) {
+      const updatedCycle = {
+        ...activeCycle,
+        availableEquipment: availableEquipment.length > 0 ? availableEquipment : undefined
+      };
+      setActiveCycle(updatedCycle);
+      setShowEquipmentModal(false);
     }
   };
 
@@ -227,15 +254,13 @@ export default function App() {
     if (!node) return;
 
     try {
-      // Use html-to-image to generate png
-      // We filter out elements with class 'export-btn' so the button itself isn't in the screenshot
-      const dataUrl = await toPng(node, { 
+      const dataUrl = await toPng(node, {
         backgroundColor: '#000000',
         filter: (childNode) => {
           return !childNode.classList?.contains('export-btn');
         }
       });
-      
+
       const link = document.createElement('a');
       link.download = `${filename}.png`;
       link.href = dataUrl;
@@ -244,6 +269,245 @@ export default function App() {
       console.error('Failed to export image', err);
       alert('Could not export image. Try again.');
     }
+  };
+
+  // Export entire week as presentation-ready images
+  const handleExportWeek = async (weekNumber: number) => {
+    if (!activeCycle) return;
+
+    const week = activeCycle.weeks.find(w => w.weekNumber === weekNumber);
+    if (!week) return;
+
+    try {
+      // Export all 3 sessions for all studios
+      for (const sessionConfig of SESSION_CONFIGS) {
+        const sessionWorkouts = generatedWorkouts.filter(
+          w => w.weekNumber === weekNumber && w.sessionType === sessionConfig.type
+        );
+
+        if (sessionWorkouts.length === 0) {
+          alert(`Please generate ${sessionConfig.name} session first.`);
+          continue;
+        }
+
+        for (const workout of sessionWorkouts) {
+          const studio = studios.find(s => s.id === workout.studioId);
+          const elementId = `workout-card-${workout.id}`;
+          const filename = `Week${weekNumber}_${sessionConfig.type}_${studio?.name}`;
+
+          await handleExportImage(elementId, filename);
+          // Small delay between exports
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+
+      alert(`Week ${weekNumber} exported successfully! Check your downloads folder.`);
+    } catch (err) {
+      console.error('Failed to export week', err);
+      alert('Could not export complete week. Try again.');
+    }
+  };
+
+  // Export presentation-ready HTML (can be opened in PowerPoint/Keynote)
+  const handleExportPresentation = async (weekNumber: number) => {
+    if (!activeCycle) return;
+
+    const week = activeCycle.weeks.find(w => w.weekNumber === weekNumber);
+    if (!week) return;
+
+    const themeInfo = WEEKLY_THEMES[week.theme as keyof typeof WEEKLY_THEMES];
+
+    // Build HTML presentation
+    let html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>${activeCycle.name} - Week ${weekNumber}</title>
+  <style>
+    body {
+      font-family: 'Inter', -apple-system, sans-serif;
+      background: #000;
+      color: #fff;
+      margin: 0;
+      padding: 40px;
+    }
+    .slide {
+      page-break-after: always;
+      min-height: 100vh;
+      padding: 60px;
+      background: #0a0a0a;
+      border: 2px solid #ffed00;
+      margin-bottom: 40px;
+    }
+    h1 {
+      font-size: 48px;
+      font-weight: bold;
+      text-transform: uppercase;
+      color: #ffed00;
+      margin-bottom: 20px;
+    }
+    h2 {
+      font-size: 32px;
+      font-weight: bold;
+      text-transform: uppercase;
+      margin-top: 40px;
+    }
+    .theme {
+      background: #1a1a1a;
+      border-left: 4px solid #42c8f7;
+      padding: 20px;
+      margin: 20px 0;
+      font-size: 14px;
+    }
+    .session {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      padding: 30px;
+      margin: 20px 0;
+    }
+    .session-title {
+      font-size: 24px;
+      font-weight: bold;
+      color: #ffed00;
+      margin-bottom: 10px;
+    }
+    .studio-tag {
+      display: inline-block;
+      background: #333;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: bold;
+      margin-bottom: 20px;
+    }
+    .section {
+      margin: 20px 0;
+    }
+    .section-label {
+      font-size: 11px;
+      font-weight: bold;
+      color: #999;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .wod {
+      background: #18181880;
+      border-left: 4px solid #ffed00;
+      padding: 20px;
+      white-space: pre-wrap;
+      font-family: monospace;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .references {
+      background: #1a2a3a;
+      border-left: 4px solid #4a90e2;
+      padding: 15px;
+      font-size: 11px;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <!-- Title Slide -->
+  <div class="slide">
+    <h1>${activeCycle.name}</h1>
+    <h2>Week ${weekNumber}: ${week.focus}</h2>
+    <div class="theme">
+      <strong>${themeInfo?.name || week.theme}</strong><br/>
+      ${themeInfo?.description || ''}<br/>
+      <em>Scientific Basis: ${themeInfo?.scientificBasis || 'Evidence-based programming'}</em>
+    </div>
+    <p style="font-size: 18px; margin-top: 40px;">
+      Volume: ${week.volume}% • Intensity: ${week.intensity}%
+    </p>
+  </div>
+`;
+
+    // Add slides for each session type
+    for (const sessionConfig of SESSION_CONFIGS) {
+      const sessionWorkouts = generatedWorkouts.filter(
+        w => w.weekNumber === weekNumber && w.sessionType === sessionConfig.type
+      );
+
+      if (sessionWorkouts.length === 0) continue;
+
+      html += `
+  <!-- ${sessionConfig.name} Slide -->
+  <div class="slide">
+    <h1>${sessionConfig.name}</h1>
+    <p style="font-size: 16px; color: #999;">${sessionConfig.description}</p>
+`;
+
+      for (const workout of sessionWorkouts) {
+        const studio = studios.find(s => s.id === workout.studioId);
+
+        html += `
+    <div class="session">
+      <div class="studio-tag">${studio?.name || 'Studio'}</div>
+      <div class="session-title">${workout.title}</div>
+
+      <div class="section">
+        <div class="section-label">Warmup</div>
+        <div>${workout.warmup}</div>
+      </div>
+
+      ${workout.skillStrength ? `
+      <div class="section">
+        <div class="section-label">Skill / Strength</div>
+        <div>${workout.skillStrength}</div>
+      </div>
+      ` : ''}
+
+      <div class="section">
+        <div class="section-label">Main Workout</div>
+        <div class="wod">${workout.wod}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-label">Cooldown</div>
+        <div>${workout.cooldown}</div>
+      </div>
+
+      ${workout.scientificReferences && workout.scientificReferences.length > 0 ? `
+      <div class="references">
+        <strong>Scientific References:</strong><br/>
+        ${workout.scientificReferences.map(ref => `• ${ref}`).join('<br/>')}
+      </div>
+      ` : ''}
+
+      <div class="section" style="background: #0a2a3a; padding: 10px; margin-top: 20px;">
+        <div class="section-label">Coach Notes</div>
+        <div style="font-size: 11px; color: #42c8f7;">${workout.coachNotes}</div>
+      </div>
+    </div>
+`;
+      }
+
+      html += `
+  </div>
+`;
+    }
+
+    html += `
+  <!-- Footer -->
+  <div style="text-align: center; margin-top: 60px; color: #666; font-size: 12px;">
+    Generated by Functional Gym Planner • Evidence-Based HYROX Programming
+  </div>
+</body>
+</html>
+`;
+
+    // Create and download HTML file
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${activeCycle.name.replace(/\s/g, '_')}_Week${weekNumber}_Presentation.html`;
+    link.click();
+    URL.revokeObjectURL(url);
+
+    alert('Presentation exported! Open the HTML file in your browser, then print/save as PDF or import into PowerPoint/Keynote.');
   };
 
   // --- Views ---
@@ -395,7 +659,7 @@ export default function App() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
         {studios.map(studio => (
-          <div key={studio.id} className="bg-black border border-zinc-800 rounded-none overflow-hidden group hover:border-zinc-600 transition-all">
+          <div key={studio.id} className="bg-black border border-zinc-800 rounded-none overflow-hidden group hover:border-zinc-600 transition-all relative">
             {studio.photoUrl && (
               <div className="h-64 w-full bg-zinc-900 overflow-hidden relative">
                  <img src={studio.photoUrl} alt={studio.name} className="w-full h-full object-cover opacity-60 grayscale group-hover:grayscale-0 transition-all duration-500" />
@@ -410,11 +674,20 @@ export default function App() {
                   <h3 className="text-3xl font-heading font-bold text-white uppercase tracking-tight leading-none mb-2">{studio.name}</h3>
                   <p className="text-sm text-[#42c8f7] font-bold uppercase tracking-widest">{studio.location} • {studio.sizeSqM}m²</p>
                 </div>
-                <div className="flex items-center gap-2 text-zinc-400 font-heading font-bold text-lg">
-                  {ICONS.Users} <span className="text-white">{studio.maxCapacity}</span>
+                <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-2 text-zinc-400 font-heading font-bold text-lg">
+                    {ICONS.Users} <span className="text-white">{studio.maxCapacity}</span>
+                  </div>
+                  <button
+                    onClick={() => handleDeleteStudio(studio.id)}
+                    className="p-2 text-zinc-500 hover:text-red-500 hover:bg-zinc-900 transition-all rounded-none border border-transparent hover:border-red-900"
+                    title="Delete Studio"
+                  >
+                    {ICONS.Delete}
+                  </button>
                 </div>
               </div>
-              
+
               <div className="space-y-4">
                 <h4 className="text-xs font-bold text-zinc-600 uppercase tracking-widest border-b border-zinc-900 pb-2">Inventory</h4>
                 <div className="flex flex-wrap gap-2">
@@ -518,17 +791,40 @@ export default function App() {
     );
 
     const activeWeek = activeCycle.weeks[currentViewWeekIndex];
+    const themeInfo = WEEKLY_THEMES[activeWeek.theme as keyof typeof WEEKLY_THEMES];
 
     return (
       <div className="flex flex-col h-[calc(100vh-4rem)]">
         <div className="flex justify-between items-end mb-8 border-b border-zinc-800 pb-6">
           <div>
-            <span className="text-[#ffed00] text-sm font-bold tracking-[0.2em] uppercase mb-2 block">{activeCycle.focus}</span>
+            <span className="text-[#ffed00] text-sm font-bold tracking-[0.2em] uppercase mb-2 block">HYROX TRAINING</span>
             <h2 className="text-5xl font-heading font-bold text-white uppercase tracking-tighter leading-none">{activeCycle.name}</h2>
           </div>
-          <div className="text-right">
-             <p className="text-zinc-500 text-xs font-bold uppercase tracking-widest">Duration</p>
-             <p className="text-3xl font-heading font-bold text-white">{activeCycle.durationWeeks} WEEKS</p>
+          <div className="text-right flex gap-4 items-end">
+             <div>
+               <p className="text-zinc-500 text-xs font-bold uppercase tracking-widest">Duration</p>
+               <p className="text-3xl font-heading font-bold text-white">{activeCycle.durationWeeks} WEEKS</p>
+             </div>
+             <button
+               onClick={() => setShowEquipmentModal(true)}
+               className="px-4 py-2 border border-zinc-700 hover:border-[#ffed00] text-zinc-400 hover:text-white transition-all text-xs uppercase font-bold tracking-wider whitespace-nowrap"
+             >
+               Equipment
+             </button>
+             <button
+               onClick={() => handleExportWeek(activeWeek.weekNumber)}
+               className="px-4 py-2 border border-zinc-700 hover:border-[#42c8f7] text-zinc-400 hover:text-white transition-all text-xs uppercase font-bold tracking-wider whitespace-nowrap flex items-center gap-2"
+               title="Export all sessions as images"
+             >
+               {ICONS.Download} Week
+             </button>
+             <button
+               onClick={() => handleExportPresentation(activeWeek.weekNumber)}
+               className="px-4 py-2 bg-[#ffed00] text-black hover:bg-white transition-all text-xs uppercase font-bold tracking-wider whitespace-nowrap"
+               title="Export as presentation"
+             >
+               Presentation
+             </button>
           </div>
         </div>
 
@@ -541,77 +837,117 @@ export default function App() {
                    <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Macrocycle</h3>
                 </div>
                 <div className="p-4 space-y-1">
-                  {activeCycle.weeks.map((week, index) => (
-                    <div 
-                      key={week.weekNumber} 
-                      onClick={() => {
-                          setCurrentViewWeekIndex(index);
-                          setSelectedDay(null); // Reset day selection when switching weeks
-                      }}
-                      className={`p-4 cursor-pointer transition-all border-l-4 ${
-                        currentViewWeekIndex === index 
-                          ? 'bg-black border-[#ffed00] text-white' 
-                          : 'bg-transparent border-transparent text-zinc-500 hover:text-white hover:bg-black/50'
-                      }`}
-                    >
-                      <div className="flex justify-between items-center mb-1">
-                        <span className="text-xl font-heading font-bold uppercase tracking-wide">
-                          Week {week.weekNumber}
-                        </span>
-                        {currentViewWeekIndex === index && (
-                           <span className="text-xs font-bold text-[#ffed00]">{week.volume}% VOL</span>
+                  {activeCycle.weeks.map((week, index) => {
+                    const weekTheme = WEEKLY_THEMES[week.theme as keyof typeof WEEKLY_THEMES];
+                    return (
+                      <div
+                        key={week.weekNumber}
+                        onClick={() => {
+                            setCurrentViewWeekIndex(index);
+                            setSelectedSession(null);
+                        }}
+                        className={`p-4 cursor-pointer transition-all border-l-4 ${
+                          currentViewWeekIndex === index
+                            ? 'bg-black border-[#ffed00] text-white'
+                            : 'bg-transparent border-transparent text-zinc-500 hover:text-white hover:bg-black/50'
+                        }`}
+                      >
+                        <div className="flex justify-between items-center mb-1">
+                          <span className="text-xl font-heading font-bold uppercase tracking-wide">
+                            Week {week.weekNumber}
+                          </span>
+                          {currentViewWeekIndex === index && (
+                             <span className="text-xs font-bold text-[#ffed00]">{week.volume}% VOL</span>
+                          )}
+                        </div>
+                        <p className="text-xs uppercase tracking-wide truncate opacity-80">{week.focus}</p>
+                        {weekTheme && (
+                          <p className="text-[10px] text-zinc-600 mt-1 uppercase tracking-wider">
+                            Theme: {weekTheme.name}
+                          </p>
                         )}
                       </div>
-                      <p className="text-xs uppercase tracking-wide truncate opacity-80">{week.focus}</p>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
              </div>
 
-             {/* Right: Daily Workout Generator */}
+             {/* Right: HYROX Weekly Session Generator */}
              <div className="col-span-9 bg-zinc-900 border border-zinc-800 rounded-none p-8 flex flex-col overflow-y-auto">
-                <div className="flex justify-between items-center mb-8">
-                  <h3 className="text-3xl font-heading font-bold text-white uppercase tracking-tight">
-                    Microcycle <span className="text-[#42c8f7]">Planning</span>
-                  </h3>
-                  <div className="text-right">
-                    <span className="text-zinc-500 text-xs font-bold uppercase tracking-widest block">Week Focus</span>
-                    <span className="text-white font-bold uppercase tracking-wide">{activeWeek.focus}</span>
+                <div className="mb-8">
+                  <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-3xl font-heading font-bold text-white uppercase tracking-tight">
+                      Week {activeWeek.weekNumber} <span className="text-[#42c8f7]">Sessions</span>
+                    </h3>
+                    <div className="text-right">
+                      <span className="text-zinc-500 text-xs font-bold uppercase tracking-widest block">Week Theme</span>
+                      <span className="text-white font-bold uppercase tracking-wide">{themeInfo?.name || activeWeek.focus}</span>
+                    </div>
                   </div>
+                  {themeInfo && (
+                    <div className="bg-zinc-950 border-l-4 border-[#42c8f7] p-4">
+                      <p className="text-xs text-zinc-400 leading-relaxed">
+                        <span className="font-bold text-[#42c8f7]">{themeInfo.description}</span>
+                        {' • '}
+                        <span className="text-zinc-500">Evidence: {themeInfo.scientificBasis}</span>
+                      </p>
+                    </div>
+                  )}
                 </div>
 
-                {/* Days Selector */}
-                <div className="grid grid-cols-7 gap-px bg-zinc-800 border border-zinc-800 mb-10">
-                  {[1, 2, 3, 4, 5, 6, 7].map(day => {
-                    const hasGenerated = generatedWorkouts.some(w => w.weekNumber === activeWeek.weekNumber && w.dayOfWeek === day);
-                    const isSelected = selectedDay?.day === day && selectedDay?.week === activeWeek.weekNumber;
-                    
+                {/* HYROX Session Selector (3 Sessions per Week) */}
+                <div className="grid grid-cols-3 gap-4 mb-10">
+                  {SESSION_CONFIGS.map(session => {
+                    const hasGenerated = generatedWorkouts.some(
+                      w => w.weekNumber === activeWeek.weekNumber && w.sessionType === session.type
+                    );
+                    const isSelected = selectedSession?.sessionType === session.type && selectedSession?.week === activeWeek.weekNumber;
+
                     return (
-                      <button 
-                        key={day}
-                        onClick={() => hasGenerated ? setSelectedDay({week: activeWeek.weekNumber, day}) : handleGenerateDay(activeWeek, day)}
+                      <button
+                        key={session.type}
+                        onClick={() =>
+                          hasGenerated
+                            ? setSelectedSession({week: activeWeek.weekNumber, sessionType: session.type as SessionType})
+                            : handleGenerateSession(activeWeek, session.type as SessionType)
+                        }
                         disabled={isGeneratingWorkout}
                         className={`
-                          py-6 flex flex-col items-center justify-center gap-2 transition-all relative overflow-hidden group
-                          ${isSelected 
-                            ? 'bg-[#ffed00] text-black' 
-                            : 'bg-zinc-900 text-zinc-400 hover:bg-black hover:text-white'
+                          p-6 flex flex-col items-start justify-between gap-3 transition-all relative overflow-hidden group border-2
+                          ${isSelected
+                            ? 'bg-[#ffed00] text-black border-[#ffed00]'
+                            : hasGenerated
+                            ? 'bg-zinc-950 text-white border-zinc-700 hover:border-[#ffed00]'
+                            : 'bg-zinc-950 text-zinc-500 border-zinc-800 hover:text-white hover:border-zinc-600'
                           }
                         `}
                       >
-                        <span className="text-sm font-heading font-bold uppercase tracking-wider z-10">Day {day}</span>
-                        {hasGenerated ? (
-                          <div className={`w-1.5 h-1.5 rounded-full ${isSelected ? 'bg-black' : 'bg-[#42c8f7]'}`}></div>
-                        ) : (
-                          <span className={`text-[10px] uppercase font-bold tracking-widest ${isSelected ? 'opacity-100' : 'opacity-0 group-hover:opacity-50'}`}>
-                             {isGeneratingWorkout && selectedDay === null ? '...' : 'Create'}
-                          </span>
-                        )}
-                        {isSelected && (
-                           <div className="absolute bottom-0 left-0 w-full h-1 bg-black/20"></div>
-                        )}
+                        <div className="w-full">
+                          <div className="flex items-center gap-2 mb-2">
+                            <div className={`w-10 h-10 flex items-center justify-center rounded-none ${isSelected ? 'bg-black/10' : session.color}`}>
+                              {session.type === 'endurance' && ICONS.Endurance}
+                              {session.type === 'strength' && ICONS.Strength}
+                              {session.type === 'class' && ICONS.Class}
+                            </div>
+                            <span className="text-xl font-heading font-bold uppercase tracking-wide">
+                              {session.name.replace('HYROX ', '')}
+                            </span>
+                          </div>
+                          <p className={`text-[10px] uppercase tracking-wider font-bold ${isSelected ? 'text-black/70' : 'text-zinc-500'}`}>
+                            {session.description}
+                          </p>
+                        </div>
+                        <div className="w-full flex justify-between items-center">
+                          {hasGenerated ? (
+                            <div className={`w-2 h-2 rounded-full ${isSelected ? 'bg-black' : 'bg-[#42c8f7]'}`}></div>
+                          ) : (
+                            <span className={`text-[10px] uppercase font-bold tracking-widest ${isSelected ? 'opacity-100' : 'opacity-0 group-hover:opacity-50'}`}>
+                               {isGeneratingWorkout && selectedSession === null ? '...' : 'Generate'}
+                            </span>
+                          )}
+                        </div>
                       </button>
-                    )
+                    );
                   })}
                 </div>
 
@@ -620,36 +956,54 @@ export default function App() {
                   {isGeneratingWorkout ? (
                     <div className="h-full flex flex-col items-center justify-center text-zinc-500 gap-6 animate-pulse">
                       <div className="w-20 h-20 border-8 border-zinc-800 border-t-[#ffed00] rounded-full animate-spin"></div>
-                      <p className="font-heading font-bold text-xl uppercase tracking-widest text-white">Adapting Stimulus...</p>
+                      <p className="font-heading font-bold text-xl uppercase tracking-widest text-white">
+                        Generating HYROX Session...
+                      </p>
                     </div>
-                  ) : selectedDay ? (
+                  ) : selectedSession ? (
                     <div className="space-y-8">
-                       {/* Render Workouts for each studio side by side */}
+                       {/* Render Workouts for each studio */}
                        <div className="grid grid-cols-1 xl:grid-cols-2 gap-8">
                           {generatedWorkouts
-                            .filter(w => w.weekNumber === selectedDay.week && w.dayOfWeek === selectedDay.day)
+                            .filter(w => w.weekNumber === selectedSession.week && w.sessionType === selectedSession.sessionType)
                             .map(workout => {
                               const studio = studios.find(s => s.id === workout.studioId);
+                              const sessionConfig = SESSION_CONFIGS.find(s => s.type === workout.sessionType);
                               const elementId = `workout-card-${workout.id}`;
+
                               return (
                                 <div id={elementId} key={workout.id} className="bg-black border border-zinc-800 rounded-none p-8 relative overflow-hidden group hover:border-zinc-600 transition-colors">
-                                  {/* Studio Tag & Export Button */}
+                                  {/* Studio Tag & Actions */}
                                   <div className="flex justify-between items-start mb-6 border-b border-zinc-800 pb-4">
-                                     <div className="p-2 bg-zinc-900 text-xs text-white font-heading font-bold uppercase tracking-widest">
-                                        {studio?.name}
+                                     <div className="flex items-center gap-2">
+                                       <div className="p-2 bg-zinc-900 text-xs text-white font-heading font-bold uppercase tracking-widest">
+                                          {studio?.name}
+                                       </div>
+                                       <div className={`p-2 ${sessionConfig?.color} text-xs text-black font-heading font-bold uppercase tracking-widest`}>
+                                          {sessionConfig?.name.replace('HYROX ', '')}
+                                       </div>
                                      </div>
-                                     <button 
-                                      onClick={() => handleExportImage(elementId, `${studio?.name}_W${workout.weekNumber}_D${workout.dayOfWeek}`)}
-                                      className="export-btn p-2 text-zinc-500 hover:text-[#ffed00] hover:bg-zinc-900 transition-all"
-                                      title="Export as Image"
-                                     >
-                                       {ICONS.Download}
-                                     </button>
+                                     <div className="flex gap-2">
+                                       <button
+                                        onClick={() => setEditingWorkout(workout)}
+                                        className="export-btn p-2 text-zinc-500 hover:text-[#42c8f7] hover:bg-zinc-900 transition-all"
+                                        title="Edit Workout"
+                                       >
+                                         {ICONS.Edit}
+                                       </button>
+                                       <button
+                                        onClick={() => handleExportImage(elementId, `${studio?.name}_W${workout.weekNumber}_${workout.sessionType}`)}
+                                        className="export-btn p-2 text-zinc-500 hover:text-[#ffed00] hover:bg-zinc-900 transition-all"
+                                        title="Export as Image"
+                                       >
+                                         {ICONS.Download}
+                                       </button>
+                                     </div>
                                   </div>
-                                  
+
                                   <h4 className="text-2xl font-heading font-bold text-white mb-2 uppercase tracking-wide pr-20">{workout.title}</h4>
                                   <div className="text-xs text-[#ffed00] mb-8 uppercase tracking-[0.2em] font-bold">
-                                    {workout.dayOfWeek === 1 ? 'Monday' : `Day ${workout.dayOfWeek}`} • Week {workout.weekNumber}
+                                    Week {workout.weekNumber} • {themeInfo?.name}
                                   </div>
 
                                   <div className="space-y-8">
@@ -657,11 +1011,34 @@ export default function App() {
                                       <h5 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3">Warmup</h5>
                                       <p className="text-sm text-zinc-300 whitespace-pre-wrap leading-relaxed font-light">{workout.warmup}</p>
                                     </div>
-                                    
+
+                                    {workout.skillStrength && (
+                                      <div>
+                                        <h5 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3">Skill / Strength</h5>
+                                        <p className="text-sm text-zinc-300 whitespace-pre-wrap leading-relaxed font-light">{workout.skillStrength}</p>
+                                      </div>
+                                    )}
+
                                     <div className="p-6 bg-zinc-900/50 border-l-4 border-[#ffed00]">
-                                      <h5 className="text-sm font-heading font-bold text-[#ffed00] uppercase mb-4 tracking-wider">Workout of the Day</h5>
+                                      <h5 className="text-sm font-heading font-bold text-[#ffed00] uppercase mb-4 tracking-wider">Main Workout</h5>
                                       <p className="text-base text-white whitespace-pre-wrap font-medium leading-relaxed font-sans">{workout.wod}</p>
                                     </div>
+
+                                    <div>
+                                      <h5 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3">Cooldown</h5>
+                                      <p className="text-sm text-zinc-300 whitespace-pre-wrap leading-relaxed font-light">{workout.cooldown}</p>
+                                    </div>
+
+                                    {workout.scientificReferences && workout.scientificReferences.length > 0 && (
+                                      <div className="bg-blue-950/20 border-l-4 border-blue-500 p-4">
+                                        <h5 className="text-xs font-bold text-blue-400 uppercase tracking-widest mb-2">Scientific Evidence</h5>
+                                        <ul className="space-y-1">
+                                          {workout.scientificReferences.map((ref, idx) => (
+                                            <li key={idx} className="text-[10px] text-zinc-400 leading-relaxed">• {ref}</li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
 
                                     <div>
                                       <h5 className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3">Capacity Management (15 Pax)</h5>
@@ -681,8 +1058,8 @@ export default function App() {
                       <div className="mb-4 opacity-20">
                          {ICONS.Cycle}
                       </div>
-                      <p className="font-heading font-bold text-2xl uppercase tracking-widest text-zinc-600">Select a Day</p>
-                      <p className="text-sm font-light uppercase tracking-wide mt-2">To generate or view programming</p>
+                      <p className="font-heading font-bold text-2xl uppercase tracking-widest text-zinc-600">Select a Session</p>
+                      <p className="text-sm font-light uppercase tracking-wide mt-2">To generate or view HYROX programming</p>
                     </div>
                   )}
                 </div>
@@ -803,6 +1180,177 @@ export default function App() {
         {view === AppView.VIEW_CYCLE && renderViewCycle()}
         {view === AppView.PROFILE && renderProfile()}
       </Layout>
+
+      {/* Equipment Constraints Modal */}
+      {showEquipmentModal && activeCycle && (
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-sm z-[100] flex items-center justify-center p-6">
+          <div className="bg-zinc-950 border-2 border-[#ffed00] max-w-4xl w-full shadow-[0_0_100px_rgba(255,237,0,0.3)] max-h-[80vh] overflow-y-auto">
+            <div className="p-8">
+              <div className="flex justify-between items-start mb-6">
+                <div>
+                  <h2 className="text-3xl font-heading font-bold text-white uppercase tracking-tight">Equipment Constraints</h2>
+                  <p className="text-zinc-400 text-sm mt-2">Select available equipment for this cycle. Workouts will only use selected equipment.</p>
+                </div>
+                <button onClick={() => setShowEquipmentModal(false)} className="text-zinc-500 hover:text-white">
+                  {ICONS.Close}
+                </button>
+              </div>
+
+              <div className="space-y-6">
+                <div className="bg-zinc-900 border border-zinc-800 p-6">
+                  <h3 className="text-sm font-bold text-zinc-400 uppercase tracking-widest mb-4">HYROX Core Equipment</h3>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                    {HYROX_EQUIPMENT.map(equipment => {
+                      const isSelected = availableEquipment.includes(equipment);
+                      return (
+                        <button
+                          key={equipment}
+                          onClick={() => {
+                            if (isSelected) {
+                              setAvailableEquipment(availableEquipment.filter(e => e !== equipment));
+                            } else {
+                              setAvailableEquipment([...availableEquipment, equipment]);
+                            }
+                          }}
+                          className={`p-3 text-xs font-bold uppercase tracking-wider transition-all border ${
+                            isSelected
+                              ? 'bg-[#ffed00] text-black border-[#ffed00]'
+                              : 'bg-zinc-950 text-zinc-400 border-zinc-700 hover:border-zinc-500'
+                          }`}
+                        >
+                          {equipment}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="bg-zinc-900 border border-zinc-800 p-6">
+                  <h3 className="text-sm font-bold text-zinc-400 uppercase tracking-widest mb-4">All Studio Equipment</h3>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                    {Array.from(new Set(studios.flatMap(s => s.equipment.map(e => e.name)))).map(equipment => {
+                      const isSelected = availableEquipment.includes(equipment);
+                      return (
+                        <button
+                          key={equipment}
+                          onClick={() => {
+                            if (isSelected) {
+                              setAvailableEquipment(availableEquipment.filter(e => e !== equipment));
+                            } else {
+                              setAvailableEquipment([...availableEquipment, equipment]);
+                            }
+                          }}
+                          className={`p-2 text-[10px] font-bold uppercase tracking-wider transition-all border ${
+                            isSelected
+                              ? 'bg-[#42c8f7] text-black border-[#42c8f7]'
+                              : 'bg-zinc-950 text-zinc-500 border-zinc-800 hover:border-zinc-600'
+                          }`}
+                        >
+                          {equipment}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex gap-4">
+                  <Button onClick={handleUpdateEquipmentConstraints} className="flex-1">
+                    Apply Constraints
+                  </Button>
+                  <Button
+                    onClick={() => setAvailableEquipment([])}
+                    variant="secondary"
+                    className="flex-1"
+                  >
+                    Reset (Allow All)
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Workout Edit Modal */}
+      {editingWorkout && (
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-sm z-[100] flex items-center justify-center p-6">
+          <div className="bg-zinc-950 border-2 border-[#42c8f7] max-w-4xl w-full shadow-[0_0_100px_rgba(66,200,247,0.3)] max-h-[80vh] overflow-y-auto">
+            <div className="p-8">
+              <div className="flex justify-between items-start mb-6">
+                <div>
+                  <h2 className="text-3xl font-heading font-bold text-white uppercase tracking-tight">Edit Workout</h2>
+                  <p className="text-zinc-400 text-sm mt-2">{editingWorkout.title}</p>
+                </div>
+                <button onClick={() => setEditingWorkout(null)} className="text-zinc-500 hover:text-white">
+                  {ICONS.Close}
+                </button>
+              </div>
+
+              <div className="space-y-6">
+                <div>
+                  <label className="block text-xs font-bold text-zinc-400 mb-2 uppercase tracking-widest">Title</label>
+                  <input
+                    type="text"
+                    value={editingWorkout.title}
+                    onChange={(e) => setEditingWorkout({...editingWorkout, title: e.target.value})}
+                    className="w-full bg-black border border-zinc-700 rounded-none px-4 py-3 text-white focus:border-[#42c8f7] focus:ring-0 outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-zinc-400 mb-2 uppercase tracking-widest">Warmup</label>
+                  <textarea
+                    value={editingWorkout.warmup}
+                    onChange={(e) => setEditingWorkout({...editingWorkout, warmup: e.target.value})}
+                    rows={3}
+                    className="w-full bg-black border border-zinc-700 rounded-none px-4 py-3 text-white focus:border-[#42c8f7] focus:ring-0 outline-none font-mono text-sm"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-zinc-400 mb-2 uppercase tracking-widest">Main Workout (WOD)</label>
+                  <textarea
+                    value={editingWorkout.wod}
+                    onChange={(e) => setEditingWorkout({...editingWorkout, wod: e.target.value})}
+                    rows={8}
+                    className="w-full bg-black border border-zinc-700 rounded-none px-4 py-3 text-white focus:border-[#42c8f7] focus:ring-0 outline-none font-mono text-sm"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-zinc-400 mb-2 uppercase tracking-widest">Cooldown</label>
+                  <textarea
+                    value={editingWorkout.cooldown}
+                    onChange={(e) => setEditingWorkout({...editingWorkout, cooldown: e.target.value})}
+                    rows={3}
+                    className="w-full bg-black border border-zinc-700 rounded-none px-4 py-3 text-white focus:border-[#42c8f7] focus:ring-0 outline-none font-mono text-sm"
+                  />
+                </div>
+
+                <div className="flex gap-4">
+                  <Button
+                    onClick={() => {
+                      // Update the workout in state
+                      setGeneratedWorkouts(generatedWorkouts.map(w => w.id === editingWorkout.id ? editingWorkout : w));
+                      setEditingWorkout(null);
+                    }}
+                    className="flex-1"
+                  >
+                    Save Changes
+                  </Button>
+                  <Button
+                    onClick={() => setEditingWorkout(null)}
+                    variant="secondary"
+                    className="flex-1"
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* API Key Required Modal */}
       {showApiKeyModal && (
